@@ -19095,10 +19095,17 @@ if (!function_exists('ar_client_get_unread_messages_count')) {
             return 0;
         }
         
-        return $wpdb->get_var($wpdb->prepare(
+        $count = $wpdb->get_var($wpdb->prepare(
             "SELECT COUNT(*) FROM $chat_table WHERE receiver_id = %d AND is_read = 0",
             $user_id
         ));
+        
+        if ($count === null) {
+            error_log('AR_CHAT: Failed to get client unread messages count for user ' . $user_id);
+            return 0;
+        }
+        
+        return intval($count);
     }
 }
 
@@ -24323,17 +24330,30 @@ function ar_get_unread_messages_count($user_id = null) {
         return 0;
     }
     
+    if ($wpdb->get_var($wpdb->prepare("SHOW TABLES LIKE %s", $orders_table)) != $orders_table) {
+        return 0;
+    }
+    
     // Получаем все заявки, где дизайнер является выбранным дизайнером
     $designer_orders = $wpdb->get_col($wpdb->prepare(
         "SELECT id FROM $orders_table WHERE selected_designer_id = %d",
         $user_id
     ));
     
+    if (empty($designer_orders) || !is_array($designer_orders)) {
+        return 0;
+    }
+    
+    // Валидируем все ID заказов - должны быть положительными целыми числами
+    $designer_orders = array_filter(array_map('intval', $designer_orders), function($id) {
+        return $id > 0;
+    });
+    
     if (empty($designer_orders)) {
         return 0;
     }
     
-    // Формируем placeholders для SQL запроса
+    // Формируем placeholders для SQL запроса с правильным экранированием
     $placeholders = implode(',', array_fill(0, count($designer_orders), '%d'));
     
     // Подготавливаем параметры для запроса
@@ -24345,10 +24365,17 @@ function ar_get_unread_messages_count($user_id = null) {
          WHERE receiver_id = %d 
          AND is_read = 0 
          AND order_id IN ($placeholders)",
-        $params
+        ...$params
     );
     
-    return $wpdb->get_var($query);
+    $count = $wpdb->get_var($query);
+    
+    if ($count === null) {
+        error_log('AR_CHAT: Failed to get unread messages count for user ' . $user_id);
+        return 0;
+    }
+    
+    return intval($count);
 }
 
 /* ========================= AJAX ОБРАБОТЧИКИ ЧАТА ========================= */
@@ -24368,6 +24395,12 @@ function ar_ajax_send_chat_message() {
     
     $user_id = get_current_user_id();
     
+    // Rate limiting: проверяем последнее сообщение пользователя
+    $last_message_time = get_transient('ar_chat_last_message_' . $user_id);
+    if ($last_message_time && (time() - $last_message_time) < 2) {
+        wp_send_json_error('Слишком частая отправка сообщений. Подождите немного.');
+    }
+    
     // Валидация данных
     if (!isset($_POST['order_id']) || !isset($_POST['receiver_id']) || !isset($_POST['message'])) {
         wp_send_json_error('Недостаточно данных');
@@ -24376,6 +24409,15 @@ function ar_ajax_send_chat_message() {
     $order_id = intval($_POST['order_id']);
     $receiver_id = intval($_POST['receiver_id']);
     $message = trim(sanitize_textarea_field($_POST['message']));
+    
+    // Дополнительная валидация
+    if ($order_id <= 0 || $receiver_id <= 0) {
+        wp_send_json_error('Неверные параметры');
+    }
+    
+    if ($user_id === $receiver_id) {
+        wp_send_json_error('Нельзя отправить сообщение самому себе');
+    }
     
     if (empty($message)) {
         wp_send_json_error('Сообщение не может быть пустым');
@@ -24387,6 +24429,11 @@ function ar_ajax_send_chat_message() {
     
     global $wpdb;
     $chat_table = $wpdb->prefix . 'designer_chat_messages';
+    
+    // Проверяем существование таблицы
+    if ($wpdb->get_var($wpdb->prepare("SHOW TABLES LIKE %s", $chat_table)) != $chat_table) {
+        wp_send_json_error('Таблица чата не найдена');
+    }
     
     // Проверяем, имеет ли пользователь доступ к этому чату
     if (!ar_has_chat_access($user_id, $order_id, $receiver_id)) {
@@ -24401,18 +24448,24 @@ function ar_ajax_send_chat_message() {
         'message' => $message,
         'is_read' => 0,
         'created_at' => current_time('mysql')
-    ]);
+    ], ['%d', '%d', '%d', '%s', '%d', '%s']);
     
     if ($result === false) {
+        error_log('AR_CHAT: Failed to insert message. Error: ' . $wpdb->last_error);
         wp_send_json_error('Ошибка при сохранении сообщения');
     }
     
     $message_id = $wpdb->insert_id;
     
+    // Устанавливаем transient для rate limiting
+    set_transient('ar_chat_last_message_' . $user_id, time(), 60);
+    
+    $current_timestamp = current_time('timestamp');
+    
     wp_send_json_success([
         'message_id' => $message_id,
         'timestamp' => current_time('mysql'),
-        'formatted_time' => date('H:i', current_time('timestamp'))
+        'formatted_time' => date('H:i', $current_timestamp)
     ]);
 }
 
@@ -24438,6 +24491,15 @@ function ar_ajax_get_chat_messages() {
     $order_id = intval($_POST['order_id']);
     $other_user_id = intval($_POST['other_user_id']);
     
+    // Валидация параметров
+    if ($order_id <= 0 || $other_user_id <= 0) {
+        wp_send_json_error('Неверные параметры');
+    }
+    
+    if ($user_id === $other_user_id) {
+        wp_send_json_error('Некорректный запрос');
+    }
+    
     // Проверяем доступ к чату
     if (!ar_has_chat_access($user_id, $order_id, $other_user_id)) {
         wp_send_json_error('Доступ к чату запрещен');
@@ -24446,7 +24508,12 @@ function ar_ajax_get_chat_messages() {
     global $wpdb;
     $chat_table = $wpdb->prefix . 'designer_chat_messages';
     
-    // Получаем сообщения
+    // Проверяем существование таблицы
+    if ($wpdb->get_var($wpdb->prepare("SHOW TABLES LIKE %s", $chat_table)) != $chat_table) {
+        wp_send_json_error('Таблица чата не найдена');
+    }
+    
+    // Получаем сообщения с использованием prepared statement
     $messages = $wpdb->get_results($wpdb->prepare(
         "SELECT * FROM $chat_table 
          WHERE order_id = %d 
@@ -24455,36 +24522,52 @@ function ar_ajax_get_chat_messages() {
         $order_id, $user_id, $other_user_id, $other_user_id, $user_id
     ));
     
+    if ($messages === null) {
+        error_log('AR_CHAT: Failed to get messages. Error: ' . $wpdb->last_error);
+        wp_send_json_error('Ошибка при получении сообщений');
+    }
+    
     // Помечаем сообщения как прочитанные
-    $wpdb->update(
+    $update_result = $wpdb->update(
         $chat_table,
         ['is_read' => 1],
         [
             'order_id' => $order_id,
             'receiver_id' => $user_id,
             'is_read' => 0
-        ]
+        ],
+        ['%d'],
+        ['%d', '%d', '%d']
     );
+    
+    if ($update_result === false) {
+        error_log('AR_CHAT: Failed to mark messages as read. Error: ' . $wpdb->last_error);
+    }
     
     // Форматируем сообщения для ответа
     $formatted_messages = [];
     foreach ($messages as $message) {
         $formatted_messages[] = [
-            'id' => $message->id,
-            'sender_id' => $message->sender_id,
-            'receiver_id' => $message->receiver_id,
+            'id' => intval($message->id),
+            'sender_id' => intval($message->sender_id),
+            'receiver_id' => intval($message->receiver_id),
             'message' => esc_html($message->message),
             'timestamp' => $message->created_at,
             'formatted_time' => date('H:i', strtotime($message->created_at)),
-            'is_sent' => ($message->sender_id == $user_id),
-            'is_read' => ($message->is_read == 1)
+            'is_sent' => (intval($message->sender_id) === $user_id),
+            'is_read' => (intval($message->is_read) === 1)
         ];
     }
     
     // Информация о собеседнике
     $other_user = get_userdata($other_user_id);
+    
+    if (!$other_user) {
+        wp_send_json_error('Собеседник не найден');
+    }
+    
     $other_user_info = [
-        'name' => $other_user ? $other_user->display_name : 'Пользователь',
+        'name' => $other_user->display_name,
         'is_online' => ar_is_user_online($other_user_id)
     ];
     
@@ -24512,11 +24595,24 @@ function ar_ajax_check_new_messages() {
     global $wpdb;
     $chat_table = $wpdb->prefix . 'designer_chat_messages';
     
+    // Проверяем существование таблицы
+    if ($wpdb->get_var($wpdb->prepare("SHOW TABLES LIKE %s", $chat_table)) != $chat_table) {
+        wp_send_json_success(['unread_count' => 0]);
+    }
+    
     // Получаем количество непрочитанных сообщений
     $unread_count = $wpdb->get_var($wpdb->prepare(
         "SELECT COUNT(*) FROM $chat_table WHERE receiver_id = %d AND is_read = 0",
         $user_id
     ));
+    
+    if ($unread_count === null) {
+        error_log('AR_CHAT: Failed to check new messages. Error: ' . $wpdb->last_error);
+        wp_send_json_error('Ошибка при проверке сообщений');
+    }
+    
+    // Обновляем время последней активности пользователя
+    update_user_meta($user_id, 'ar_last_activity', current_time('mysql'));
     
     wp_send_json_success([
         'unread_count' => intval($unread_count)
@@ -24525,8 +24621,25 @@ function ar_ajax_check_new_messages() {
 
 // Проверка доступа к чату
 function ar_has_chat_access($user_id, $order_id, $other_user_id) {
+    // Валидация входных параметров
+    if (!$user_id || !$order_id || !$other_user_id) {
+        error_log('AR_CHAT: Invalid parameters in ar_has_chat_access');
+        return false;
+    }
+    
+    if ($user_id === $other_user_id) {
+        error_log('AR_CHAT: User trying to chat with themselves');
+        return false;
+    }
+    
     global $wpdb;
     $orders_table = $wpdb->prefix . 'client_orders';
+    
+    // Проверяем существование таблицы
+    if ($wpdb->get_var($wpdb->prepare("SHOW TABLES LIKE %s", $orders_table)) != $orders_table) {
+        error_log('AR_CHAT: Orders table does not exist');
+        return false;
+    }
     
     // Получаем информацию о заявке
     $order = $wpdb->get_row($wpdb->prepare(
@@ -24535,26 +24648,38 @@ function ar_has_chat_access($user_id, $order_id, $other_user_id) {
     ));
     
     if (!$order) {
+        error_log('AR_CHAT: Order not found: ' . $order_id);
         return false;
     }
     
     // Проверяем, что дизайнер выбран
-    if (empty($order->selected_designer_id)) {
+    if (empty($order->selected_designer_id) || intval($order->selected_designer_id) <= 0) {
+        error_log('AR_CHAT: No designer selected for order: ' . $order_id);
         return false;
     }
     
     // Проверяем, что заявка не удалена или отменена
     $forbidden_statuses = ['deleted', 'cancelled', 'rejected'];
     if (in_array($order->status, $forbidden_statuses)) {
+        error_log('AR_CHAT: Order has forbidden status: ' . $order->status);
         return false;
     }
     
     // Проверяем, является ли пользователь клиентом или дизайнером этой заявки
-    $is_client = ($user_id == $order->client_id);
-    $is_designer = ($user_id == $order->selected_designer_id);
-    $is_other_party = ($other_user_id == $order->client_id) || ($other_user_id == $order->selected_designer_id);
+    $is_client = (intval($user_id) === intval($order->client_id));
+    $is_designer = (intval($user_id) === intval($order->selected_designer_id));
+    $is_other_party = (intval($other_user_id) === intval($order->client_id)) || (intval($other_user_id) === intval($order->selected_designer_id));
     
-    return ($is_client || $is_designer) && $is_other_party;
+    $has_access = ($is_client || $is_designer) && $is_other_party;
+    
+    if (!$has_access) {
+        error_log(sprintf(
+            'AR_CHAT: Access denied. User: %d, Order: %d, Other: %d, Client: %d, Designer: %d',
+            $user_id, $order_id, $other_user_id, $order->client_id, $order->selected_designer_id
+        ));
+    }
+    
+    return $has_access;
 }
 
 // Проверка онлайн статуса пользователя с улучшенной логикой
